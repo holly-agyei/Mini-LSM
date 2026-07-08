@@ -76,6 +76,7 @@ public:
     void flush();  // force the active memtable out to a new SSTable
     void close();  // flush and release file handles
 
+
     // ---- benchmark instrumentation ----
     uint64_t sstables_consulted_total() const { return consulted_; }
     uint64_t point_reads_total() const { return point_reads_; }
@@ -93,6 +94,8 @@ private:
     void save_manifest();
     // Rebuild levels from the MANIFEST and replay the WAL into a fresh memtable.
     void recover();
+    // Flush the active memtable to a new SSTable. Assumes the caller already holds mu_.
+    void flush_locked();
     // Append one record to the WAL and make it durable.
     void wal_append(const std::string& key, const Slot& value);
 
