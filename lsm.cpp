@@ -135,6 +135,72 @@ void LSM::flush_locked() {
     }
 }
 
+// ------------------------------------------------------------------ reads
+
+std::optional<std::string> LSM::get(const std::string& key) {
+    std::lock_guard<std::mutex> lock(mu_);
+    // The memtable holds the newest version of every recently written key.
+    if (auto it = mem_.find(key); it != mem_.end()) return it->second;  // value, or nullopt for a tombstone
+
+    // Otherwise walk the SSTables newest-to-oldest and return the first match.
+    ++point_reads_;
+    for (auto& lvl : levels_) {
+        for (auto it = lvl.rbegin(); it != lvl.rend(); ++it) {  // back of a level is the newest table
+            const auto& t = *it;
+            if (key < t->min_key || key > t->max_key) continue;  // range miss — no file read, no amplification
+            ++consulted_;
+            Slot out;
+            if (t->get(key, out)) return out;  // first hit wins; a tombstone returns nullopt
+        }
+    }
+    return std::nullopt;
+}
+
+std::vector<std::pair<std::string, std::string>> LSM::scan(const std::string& start, const std::string& end) {
+    std::lock_guard<std::mutex> lock(mu_);
+    // Merge every source newest-first into a sorted view; the first writer of a key wins (is newest).
+    std::map<std::string, Slot> view;
+    auto consider = [&](const std::string& k, const Slot& v) {
+        if (k < start || k >= end) return;
+        view.emplace(k, v);
+    };
+    for (const auto& [k, v] : mem_) consider(k, v);  // memtable is newest
+    for (auto& lvl : levels_) {
+        for (auto it = lvl.rbegin(); it != lvl.rend(); ++it) {
+            const auto& t = *it;
+            if (t->max_key < start || t->min_key >= end) continue;  // no overlap with the range
+            t->for_each(consider);
+        }
+    }
+    std::vector<std::pair<std::string, std::string>> result;
+    for (auto& [k, v] : view)
+        if (v) result.emplace_back(k, *v);  // drop tombstones
+    return result;
+}
+
+// ------------------------------------------------------------------ stats
+
+uint64_t LSM::disk_footprint_bytes() const {
+    uint64_t total = 0;
+    for (const auto& lvl : levels_)
+        for (const auto& t : lvl) total += t->file_size;
+    if (fs::exists(wal_path_)) total += fs::file_size(wal_path_);
+    return total;
+}
+
+size_t LSM::sstable_count() const {
+    size_t n = 0;
+    for (const auto& lvl : levels_) n += lvl.size();
+    return n;
+}
+
+int LSM::level_count() const {
+    int n = 0;
+    for (const auto& lvl : levels_)
+        if (!lvl.empty()) ++n;
+    return n;
+}
+
 // ------------------------------------------------------------------ SSTable I/O
 
 // Encode one entry: [klen:4][key][vlen:4][value]; a tombstone stores vlen == kTombstone and no value.
