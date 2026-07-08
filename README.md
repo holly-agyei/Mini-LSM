@@ -40,4 +40,38 @@ Compiler: `g++ -std=c++20 -O2 -pthread` (Apple clang works too).
 
 ## Results
 
-Measured numbers and the full benchmark methodology land here once the harness has run.
+Measured on an Apple laptop (macOS, clang `-O2`), single-threaded, `make bench-rocksdb`.
+Workload: 1,000,000 keys, 100-byte values, 256 KB memtable, `level_max_tables = 4`.
+
+| Metric                     | Mini LSM            | Notes                                    |
+|----------------------------|---------------------|------------------------------------------|
+| Sequential write           | 75 K ops/s (7.8 MB/s) | 1M keys in sorted order                 |
+| Random write               | 75 K ops/s (7.9 MB/s) | 1M keys shuffled                        |
+| Point read                 | 19 K ops/s (53 µs)  | 500K random existing keys                |
+| Range scan                 | 1.4 M rows/s        | full range in 1K-key windows             |
+| Read amplification         | 7.6×                | SSTables read per point lookup, 3 levels |
+| Write amplification        | 5.3×                | bytes written to disk ÷ user bytes       |
+| Disk footprint             | 114 MB, 8 SSTables  | 3 levels                                 |
+| Source lines               | 816 code (1,053 raw)| across 4 files                           |
+
+### Honest comparison vs RocksDB (defaults, same workload)
+
+| Operation | Mini LSM   | RocksDB    | Ratio         |
+|-----------|------------|------------|---------------|
+| Write     | 75 K ops/s | 167 K ops/s| 2.2× slower   |
+| Read      | 19 K ops/s | 270 K ops/s| 14.2× slower  |
+
+### Reading the numbers
+
+- **Writes land within ~2× of RocksDB.** Buffered WAL + memtable + batched flushes keep the write
+  path cheap; the 5.3× write amplification is the compaction cost of keeping reads sorted.
+- **Reads are amplification-bound.** With no bloom filter, a point lookup probes every SSTable whose
+  key range covers the key — 7.6 files on average here. That is the single biggest gap to RocksDB,
+  whose per-table bloom filters skip almost all of those reads. A bloom filter (one bit-array per
+  SSTable, checked before the block read) is the standard fix and the obvious next step.
+- **Scans are fast** because the sparse index seeks straight to the overlapping blocks rather than
+  scanning whole files.
+
+Smaller memtables create more levels and therefore *more* read amplification and slower reads; larger
+memtables do the reverse. The 256 KB setting above is chosen to exercise multiple levels; a 2 MB
+memtable roughly doubles read throughput at 2 levels. Every number here is reproduced by `make bench`.

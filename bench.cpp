@@ -145,7 +145,7 @@ int main() {
 #ifdef HAVE_ROCKSDB
     {
         fs::remove_all("bench_data_rocks");
-        rocksdb::DB* rdb = nullptr;
+        std::unique_ptr<rocksdb::DB> rdb;
         rocksdb::Options ro; ro.create_if_missing = true;
         rocksdb::DB::Open(ro, "bench_data_rocks", &rdb);
         rocksdb::WriteOptions wo;
@@ -159,7 +159,7 @@ int main() {
         for (int i = 0; i < READS; ++i) rdb->Get(rdo, keys[shuffled[i]], &got);
         double rt = secs(t1, Clock::now());
         double rocks_read = READS / rt;
-        delete rdb;
+        rdb.reset();
         fs::remove_all("bench_data_rocks");
         char buf[160];
         std::snprintf(buf, sizeof(buf),

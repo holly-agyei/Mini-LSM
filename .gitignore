@@ -11,3 +11,4 @@ test_data_*/
 
 # benchmark run output
 bench_out.txt
+bench_rocks_out.txt
