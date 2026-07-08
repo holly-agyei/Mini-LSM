@@ -8,3 +8,6 @@ mlsm_data/
 bench_data/
 test_data_*/
 *.sst
+
+# benchmark run output
+bench_out.txt

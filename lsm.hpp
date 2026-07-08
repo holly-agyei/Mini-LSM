@@ -58,8 +58,11 @@ struct SSTable {
     void open();
     // Point lookup. Returns true if the key exists in this table, filling `out` (tombstone => empty Slot).
     bool get(const std::string& key, Slot& out) const;
-    // Visit every entry in key order. Used by scan and by compaction merges.
+    // Visit every entry in key order. Used by compaction merges.
     void for_each(const std::function<void(const std::string&, const Slot&)>& fn) const;
+    // Visit only the entries in [start, end), reading just the blocks that overlap the range.
+    void scan_range(const std::string& start, const std::string& end,
+                    const std::function<void(const std::string&, const Slot&)>& fn) const;
 };
 
 class LSM {

@@ -7,7 +7,6 @@
 #include <cstring>
 #include <filesystem>
 #include <queue>
-#include <system_error>
 
 namespace fs = std::filesystem;
 
@@ -164,18 +163,14 @@ std::vector<std::pair<std::string, std::string>> LSM::scan(const std::string& st
     std::lock_guard<std::mutex> lock(mu_);
     // Merge every source newest-first into a sorted view; the first writer of a key wins (is newest).
     std::map<std::string, Slot> view;
-    auto consider = [&](const std::string& k, const Slot& v) {
-        if (k < start || k >= end) return;
-        view.emplace(k, v);
-    };
-    for (const auto& [k, v] : mem_) consider(k, v);  // memtable is newest
-    for (auto& lvl : levels_) {
-        for (auto it = lvl.rbegin(); it != lvl.rend(); ++it) {
-            const auto& t = *it;
-            if (t->max_key < start || t->min_key >= end) continue;  // no overlap with the range
-            t->for_each(consider);
-        }
-    }
+    auto consider = [&](const std::string& k, const Slot& v) { view.emplace(k, v); };  // first (newest) writer wins
+    // Memtable is newest: walk only its [start, end) sub-range.
+    for (auto it = mem_.lower_bound(start); it != mem_.end() && it->first < end; ++it)
+        consider(it->first, it->second);
+    // Then SSTables newest-to-oldest, each reading only the overlapping blocks.
+    for (auto& lvl : levels_)
+        for (auto it = lvl.rbegin(); it != lvl.rend(); ++it)
+            (*it)->scan_range(start, end, consider);
     std::vector<std::pair<std::string, std::string>> result;
     for (auto& [k, v] : view)
         if (v) result.emplace_back(k, *v);  // drop tombstones
@@ -315,7 +310,7 @@ bool SSTable::get(const std::string& key, Slot& out) const {
     return false;
 }
 
-// Visit every entry in key order (used by scan and compaction).
+// Visit every entry in key order (used by compaction).
 void SSTable::for_each(const std::function<void(const std::string&, const Slot&)>& fn) const {
     in_.clear();
     in_.seekg(0);
@@ -332,6 +327,40 @@ void SSTable::for_each(const std::function<void(const std::string&, const Slot&)
             std::string v(data, pos, vlen); pos += vlen;
             fn(k, v);
         }
+    }
+}
+
+// Visit only the entries in [start, end). Uses the sparse index to read just the overlapping
+// blocks instead of the whole file, so a narrow scan touches only a little data.
+void SSTable::scan_range(const std::string& start, const std::string& end,
+                         const std::function<void(const std::string&, const Slot&)>& fn) const {
+    if (max_key < start || min_key >= end) return;  // no overlap with the range
+
+    // First block that might hold `start`: the last index entry whose key is <= start.
+    auto lo = std::upper_bound(index.begin(), index.end(), start,
+                               [](const std::string& k, const IndexEntry& e) { return k < e.key; });
+    size_t blo = (lo == index.begin()) ? 0 : static_cast<size_t>(std::distance(index.begin(), lo) - 1);
+    // First block whose first key is >= end: everything from there on is out of range.
+    auto hi = std::lower_bound(index.begin(), index.end(), end,
+                               [](const IndexEntry& e, const std::string& k) { return e.key < k; });
+
+    uint64_t from = index[blo].offset;
+    uint64_t to   = (hi == index.end()) ? index_offset : hi->offset;
+    if (to <= from) to = (blo + 1 < index.size()) ? index[blo + 1].offset : index_offset;
+
+    in_.clear();
+    in_.seekg(static_cast<std::streamoff>(from));
+    std::string block(to - from, '\0');
+    in_.read(block.data(), static_cast<std::streamsize>(to - from));
+    size_t pos = 0;
+    while (pos < block.size()) {
+        uint32_t klen = get_u32(&block[pos]); pos += 4;
+        std::string k(block, pos, klen);      pos += klen;
+        uint32_t vlen = get_u32(&block[pos]); pos += 4;
+        Slot v;
+        if (vlen != kTombstone) { v = std::string(block, pos, vlen); pos += vlen; }
+        if (k >= end) return;            // sorted, so nothing past here is in range
+        if (k >= start) fn(k, v);
     }
 }
 
