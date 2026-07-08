@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <queue>
@@ -131,6 +132,137 @@ void LSM::flush_locked() {
     // Compact any level that is now over budget (cascades downward inside compact()).
     for (int L = 0; L < static_cast<int>(levels_.size()); ++L) {
         if (static_cast<int>(levels_[L].size()) > opts_.level_max_tables) { compact(L); break; }
+    }
+}
+
+// ------------------------------------------------------------------ SSTable I/O
+
+// Encode one entry: [klen:4][key][vlen:4][value]; a tombstone stores vlen == kTombstone and no value.
+static void encode_entry(std::string& buf, const std::string& key, const Slot& value) {
+    put_u32(buf, static_cast<uint32_t>(key.size()));
+    buf += key;
+    if (value) { put_u32(buf, static_cast<uint32_t>(value->size())); buf += *value; }
+    else       { put_u32(buf, kTombstone); }
+}
+
+// Write a sorted table of entries to a new SSTable file and return its in-memory metadata.
+// Returns nullptr if `table` is empty (e.g. a compaction that dropped everything).
+std::shared_ptr<SSTable> LSM::write_sstable(const std::map<std::string, Slot>& table, int /*level*/) {
+    if (table.empty()) return nullptr;
+    auto sst = std::make_shared<SSTable>();
+    sst->seq = next_seq_++;
+    char name[32];
+    std::snprintf(name, sizeof(name), "sst_%06llu.sst", static_cast<unsigned long long>(sst->seq));
+    sst->path = opts_.data_dir + "/" + name;
+
+    std::ofstream out(sst->path, std::ios::binary | std::ios::trunc);
+    std::vector<IndexEntry> index;
+    uint64_t offset = 0, last_offset = 0;
+    std::string last_key;
+    int i = 0;
+    for (const auto& [k, v] : table) {
+        if (i % opts_.index_interval == 0) index.push_back({k, offset});  // sample the block's first key
+        std::string rec;
+        encode_entry(rec, k, v);
+        out.write(rec.data(), static_cast<std::streamsize>(rec.size()));
+        last_key = k;
+        last_offset = offset;
+        offset += rec.size();
+        ++i;
+    }
+    // Always index the final key so max_key is exact and the last block has a tight bound.
+    if (index.empty() || index.back().key != last_key) index.push_back({last_key, last_offset});
+
+    uint64_t index_offset = offset;
+    std::string idx;
+    for (const auto& e : index) { put_u32(idx, static_cast<uint32_t>(e.key.size())); idx += e.key; put_u64(idx, e.offset); }
+    out.write(idx.data(), static_cast<std::streamsize>(idx.size()));
+    std::string footer;
+    put_u64(footer, index_offset);  // 8-byte trailer points back at the index block
+    out.write(footer.data(), 8);
+    out.close();
+
+    sst->index        = std::move(index);
+    sst->index_offset = index_offset;
+    sst->min_key      = sst->index.front().key;
+    sst->max_key      = sst->index.back().key;
+    sst->file_size    = fs::file_size(sst->path);
+    bytes_written_ += sst->file_size;
+    return sst;
+}
+
+// Load the sparse index and key range from an existing SSTable file.
+void SSTable::open() {
+    std::ifstream in(path, std::ios::binary);
+    in.seekg(0, std::ios::end);
+    file_size = static_cast<uint64_t>(in.tellg());
+    char foot[8];
+    in.seekg(static_cast<std::streamoff>(file_size - 8));
+    in.read(foot, 8);
+    index_offset = get_u64(foot);
+
+    uint64_t idx_bytes = file_size - 8 - index_offset;
+    std::string blob(idx_bytes, '\0');
+    in.seekg(static_cast<std::streamoff>(index_offset));
+    in.read(blob.data(), static_cast<std::streamsize>(idx_bytes));
+    index.clear();
+    size_t pos = 0;
+    while (pos < idx_bytes) {
+        uint32_t klen = get_u32(&blob[pos]); pos += 4;
+        std::string key(blob, pos, klen);   pos += klen;
+        uint64_t off = get_u64(&blob[pos]);  pos += 8;
+        index.push_back({std::move(key), off});
+    }
+    min_key = index.front().key;
+    max_key = index.back().key;
+}
+
+// Point lookup. Binary-search the sparse index for the containing block, then scan it.
+bool SSTable::get(const std::string& key, Slot& out) const {
+    if (key < min_key || key > max_key) return false;
+    // Find the first index entry whose key is greater than the target; the block before it holds `key`.
+    auto it = std::upper_bound(index.begin(), index.end(), key,
+                               [](const std::string& k, const IndexEntry& e) { return k < e.key; });
+    size_t bi = (it == index.begin()) ? 0 : static_cast<size_t>(std::distance(index.begin(), it) - 1);
+    uint64_t start = index[bi].offset;
+    uint64_t stop  = (bi + 1 < index.size()) ? index[bi + 1].offset : index_offset;
+
+    std::ifstream in(path, std::ios::binary);
+    in.seekg(static_cast<std::streamoff>(start));
+    std::string block(stop - start, '\0');
+    in.read(block.data(), static_cast<std::streamsize>(stop - start));
+    size_t pos = 0;
+    while (pos < block.size()) {
+        uint32_t klen = get_u32(&block[pos]); pos += 4;
+        std::string k(block, pos, klen);      pos += klen;
+        uint32_t vlen = get_u32(&block[pos]); pos += 4;
+        if (vlen == kTombstone) {
+            if (k == key) { out = std::nullopt; return true; }
+        } else {
+            std::string v(block, pos, vlen); pos += vlen;
+            if (k == key) { out = std::move(v); return true; }
+        }
+        if (k > key) return false;  // entries are sorted, so we have passed where the key would be
+    }
+    return false;
+}
+
+// Visit every entry in key order (used by scan and compaction).
+void SSTable::for_each(const std::function<void(const std::string&, const Slot&)>& fn) const {
+    std::ifstream in(path, std::ios::binary);
+    std::string data(index_offset, '\0');
+    in.read(data.data(), static_cast<std::streamsize>(index_offset));
+    size_t pos = 0;
+    while (pos < index_offset) {
+        uint32_t klen = get_u32(&data[pos]); pos += 4;
+        std::string k(data, pos, klen);      pos += klen;
+        uint32_t vlen = get_u32(&data[pos]); pos += 4;
+        if (vlen == kTombstone) {
+            fn(k, std::nullopt);
+        } else {
+            std::string v(data, pos, vlen); pos += vlen;
+            fn(k, v);
+        }
     }
 }
 
