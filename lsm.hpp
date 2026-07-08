@@ -52,8 +52,9 @@ struct SSTable {
     std::string             max_key;   // largest key in the file
     uint64_t                index_offset = 0;  // byte offset where the index block begins
     uint64_t                file_size    = 0;  // size on disk, for footprint accounting
+    mutable std::ifstream   in_;               // read handle kept open so lookups avoid re-opening the file
 
-    // Load the sparse index and key range from an existing file.
+    // Load the sparse index and key range from an existing file (also opens the read handle).
     void open();
     // Point lookup. Returns true if the key exists in this table, filling `out` (tombstone => empty Slot).
     bool get(const std::string& key, Slot& out) const;
@@ -84,10 +85,13 @@ public:
     uint64_t disk_footprint_bytes() const;                            // live bytes currently on disk
     size_t   sstable_count() const;
     int      level_count() const;
+    int      tables_at_level(int level) const {                       // table count at one level
+        return level < static_cast<int>(levels_.size()) ? static_cast<int>(levels_[level].size()) : 0;
+    }
 
 private:
-    // Persist the memtable `table` to a new SSTable file and register it at level 0.
-    std::shared_ptr<SSTable> write_sstable(const std::map<std::string, Slot>& table, int level);
+    // Persist a sorted, de-duplicated run of entries to a new SSTable file at `level`.
+    std::shared_ptr<SSTable> write_sstable(const std::vector<std::pair<std::string, Slot>>& entries, int level);
     // Merge every table at `level` into one new table at `level+1`, then cascade downward.
     void compact(int level);
     // Rewrite the MANIFEST so the current level layout survives a restart.

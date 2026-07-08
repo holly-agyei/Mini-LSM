@@ -84,8 +84,9 @@ void LSM::wal_append(const std::string& key, const Slot& value) {
     std::string record;
     put_u32(record, crc32(payload.data(), payload.size()));  // checksum precedes the payload
     record += payload;
+    // Buffered write. The stream is flushed to the OS at every flush()/close() and on destruction,
+    // which is where the memtable is made durable — so a per-record fsync would only add latency.
     wal_.write(record.data(), static_cast<std::streamsize>(record.size()));
-    wal_.flush();
     bytes_written_ += record.size();
 }
 
@@ -119,8 +120,11 @@ void LSM::flush_locked() {
     frozen.swap(mem_);
     mem_bytes_ = 0;
 
-    auto table = write_sstable(frozen, 0);
-    levels_[0].push_back(table);
+    // The memtable is already sorted, so copy it straight into a run vector.
+    std::vector<std::pair<std::string, Slot>> run;
+    run.reserve(frozen.size());
+    for (auto& [k, v] : frozen) run.emplace_back(k, v);
+    levels_[0].push_back(write_sstable(run, 0));
 
     // The data is now durable in the SSTable, so reset the WAL to reclaim its space.
     wal_.close();
@@ -211,41 +215,36 @@ static void encode_entry(std::string& buf, const std::string& key, const Slot& v
     else       { put_u32(buf, kTombstone); }
 }
 
-// Write a sorted table of entries to a new SSTable file and return its in-memory metadata.
-// Returns nullptr if `table` is empty (e.g. a compaction that dropped everything).
-std::shared_ptr<SSTable> LSM::write_sstable(const std::map<std::string, Slot>& table, int /*level*/) {
-    if (table.empty()) return nullptr;
+// Write a sorted, de-duplicated run of entries to a new SSTable file and return its metadata.
+// Returns nullptr if the run is empty (e.g. a compaction that dropped everything).
+std::shared_ptr<SSTable> LSM::write_sstable(const std::vector<std::pair<std::string, Slot>>& entries, int /*level*/) {
+    if (entries.empty()) return nullptr;
     auto sst = std::make_shared<SSTable>();
     sst->seq = next_seq_++;
     char name[32];
     std::snprintf(name, sizeof(name), "sst_%06llu.sst", static_cast<unsigned long long>(sst->seq));
     sst->path = opts_.data_dir + "/" + name;
 
-    std::ofstream out(sst->path, std::ios::binary | std::ios::trunc);
+    // Build the whole file body in one buffer, sampling the sparse index as we go, then write once.
+    std::string body;
     std::vector<IndexEntry> index;
-    uint64_t offset = 0, last_offset = 0;
-    std::string last_key;
-    int i = 0;
-    for (const auto& [k, v] : table) {
-        if (i % opts_.index_interval == 0) index.push_back({k, offset});  // sample the block's first key
-        std::string rec;
-        encode_entry(rec, k, v);
-        out.write(rec.data(), static_cast<std::streamsize>(rec.size()));
-        last_key = k;
-        last_offset = offset;
-        offset += rec.size();
-        ++i;
+    uint64_t last_offset = 0;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        uint64_t off = body.size();
+        if (i % opts_.index_interval == 0) index.push_back({entries[i].first, off});
+        encode_entry(body, entries[i].first, entries[i].second);
+        last_offset = off;
     }
     // Always index the final key so max_key is exact and the last block has a tight bound.
-    if (index.empty() || index.back().key != last_key) index.push_back({last_key, last_offset});
+    if (index.back().key != entries.back().first)
+        index.push_back({entries.back().first, last_offset});
 
-    uint64_t index_offset = offset;
-    std::string idx;
-    for (const auto& e : index) { put_u32(idx, static_cast<uint32_t>(e.key.size())); idx += e.key; put_u64(idx, e.offset); }
-    out.write(idx.data(), static_cast<std::streamsize>(idx.size()));
-    std::string footer;
-    put_u64(footer, index_offset);  // 8-byte trailer points back at the index block
-    out.write(footer.data(), 8);
+    uint64_t index_offset = body.size();
+    for (const auto& e : index) { put_u32(body, static_cast<uint32_t>(e.key.size())); body += e.key; put_u64(body, e.offset); }
+    put_u64(body, index_offset);  // 8-byte trailer points back at the index block
+
+    std::ofstream out(sst->path, std::ios::binary | std::ios::trunc);
+    out.write(body.data(), static_cast<std::streamsize>(body.size()));
     out.close();
 
     sst->index        = std::move(index);
@@ -253,24 +252,27 @@ std::shared_ptr<SSTable> LSM::write_sstable(const std::map<std::string, Slot>& t
     sst->min_key      = sst->index.front().key;
     sst->max_key      = sst->index.back().key;
     sst->file_size    = fs::file_size(sst->path);
+    sst->in_.open(sst->path, std::ios::binary);  // keep a read handle open for fast lookups
     bytes_written_ += sst->file_size;
     return sst;
 }
 
 // Load the sparse index and key range from an existing SSTable file.
 void SSTable::open() {
-    std::ifstream in(path, std::ios::binary);
-    in.seekg(0, std::ios::end);
-    file_size = static_cast<uint64_t>(in.tellg());
+    in_.open(path, std::ios::binary);
+    in_.seekg(0, std::ios::end);
+    file_size = static_cast<uint64_t>(in_.tellg());
     char foot[8];
-    in.seekg(static_cast<std::streamoff>(file_size - 8));
-    in.read(foot, 8);
+    in_.clear();
+    in_.seekg(static_cast<std::streamoff>(file_size - 8));
+    in_.read(foot, 8);
     index_offset = get_u64(foot);
 
     uint64_t idx_bytes = file_size - 8 - index_offset;
     std::string blob(idx_bytes, '\0');
-    in.seekg(static_cast<std::streamoff>(index_offset));
-    in.read(blob.data(), static_cast<std::streamsize>(idx_bytes));
+    in_.clear();
+    in_.seekg(static_cast<std::streamoff>(index_offset));
+    in_.read(blob.data(), static_cast<std::streamsize>(idx_bytes));
     index.clear();
     size_t pos = 0;
     while (pos < idx_bytes) {
@@ -293,10 +295,10 @@ bool SSTable::get(const std::string& key, Slot& out) const {
     uint64_t start = index[bi].offset;
     uint64_t stop  = (bi + 1 < index.size()) ? index[bi + 1].offset : index_offset;
 
-    std::ifstream in(path, std::ios::binary);
-    in.seekg(static_cast<std::streamoff>(start));
+    in_.clear();
+    in_.seekg(static_cast<std::streamoff>(start));
     std::string block(stop - start, '\0');
-    in.read(block.data(), static_cast<std::streamsize>(stop - start));
+    in_.read(block.data(), static_cast<std::streamsize>(stop - start));
     size_t pos = 0;
     while (pos < block.size()) {
         uint32_t klen = get_u32(&block[pos]); pos += 4;
@@ -315,9 +317,10 @@ bool SSTable::get(const std::string& key, Slot& out) const {
 
 // Visit every entry in key order (used by scan and compaction).
 void SSTable::for_each(const std::function<void(const std::string&, const Slot&)>& fn) const {
-    std::ifstream in(path, std::ios::binary);
+    in_.clear();
+    in_.seekg(0);
     std::string data(index_offset, '\0');
-    in.read(data.data(), static_cast<std::streamsize>(index_offset));
+    in_.read(data.data(), static_cast<std::streamsize>(index_offset));
     size_t pos = 0;
     while (pos < index_offset) {
         uint32_t klen = get_u32(&data[pos]); pos += 4;
@@ -352,12 +355,35 @@ void LSM::compact(int level) {
     std::sort(sources.begin(), sources.end(),
               [](const auto& a, const auto& b) { return a->seq < b->seq; });
 
-    std::map<std::string, Slot> merged;
-    for (const auto& t : sources)
-        t->for_each([&](const std::string& k, const Slot& v) { merged[k] = v; });
-    if (drop_tombstones)
-        for (auto it = merged.begin(); it != merged.end();)
-            it = it->second ? std::next(it) : merged.erase(it);
+    // Load each already-sorted source, then k-way merge them. A larger source index means a newer
+    // table, so on a key collision the highest index wins.
+    std::vector<std::vector<std::pair<std::string, Slot>>> runs(sources.size());
+    for (size_t i = 0; i < sources.size(); ++i)
+        sources[i]->for_each([&](const std::string& k, const Slot& v) { runs[i].emplace_back(k, v); });
+
+    struct Cursor { const std::string* key; int src; };
+    auto cmp = [](const Cursor& a, const Cursor& b) {
+        if (*a.key != *b.key) return *a.key > *b.key;  // min-heap by key
+        return a.src < b.src;                          // for equal keys, pop older (smaller src) first
+    };
+    std::priority_queue<Cursor, std::vector<Cursor>, decltype(cmp)> pq(cmp);
+    std::vector<size_t> pos(runs.size(), 0);
+    for (size_t i = 0; i < runs.size(); ++i)
+        if (!runs[i].empty()) pq.push({&runs[i][0].first, static_cast<int>(i)});
+
+    std::vector<std::pair<std::string, Slot>> merged;
+    while (!pq.empty()) {
+        const std::string key = *pq.top().key;
+        Slot newest;
+        int best = -1;
+        while (!pq.empty() && *pq.top().key == key) {  // consume every copy of this key
+            int s = pq.top().src;
+            pq.pop();
+            if (s > best) { best = s; newest = runs[s][pos[s]].second; }  // keep the newest version
+            if (++pos[s] < runs[s].size()) pq.push({&runs[s][pos[s]].first, s});
+        }
+        if (newest || !drop_tombstones) merged.emplace_back(key, std::move(newest));
+    }
 
     auto out = write_sstable(merged, target);  // nullptr if the merge dropped everything
 
