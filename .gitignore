@@ -1,0 +1,10 @@
+# build artifacts
+test
+bench
+*.o
+
+# runtime data directories (SSTables, WAL, benchmark datasets)
+mlsm_data/
+bench_data/
+test_data_*/
+*.sst
